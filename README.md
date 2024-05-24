@@ -1,5 +1,6 @@
 # DLNLP_assignment_24
 PLEASE REMEMBER TO DOWNLOAD THE DATASET FILES FOR RECOMMENDATION. REFER TO DLNLP_assignment_24/Datasets/Recommendation/ SECTION BELOW.
+Please download this file to see a clearer formatting.
 
 Project Directory Structure and Description
 This project directory contains multiple subdirectories and files organised to facilitate various machine learning tasks, including recipe translation, recommendation, and generation. Below is a detailed description of the directory structure and the purpose of each component.
