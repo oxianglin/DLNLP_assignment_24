@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
 import pandas as pd
 from transformers import BertTokenizer, BertModel
 from sklearn.model_selection import train_test_split
@@ -25,7 +26,7 @@ import datetime
 # The energy scores are transposed to prepare them for batch matrix multiplication.
 # The parameter vector v is repeated for all batches and prepared for batch matrix multiplication.
 # The attention weights are computed by performing batch matrix multiplication between v and the energy scores.
-# Finally, a softmax function is applied to the attention weights to ensure they are normalised and sum up to 1.
+# Finally, a softmax function is applied to the attention weights to ensure they are normalized and sum up to 1.
 # This attention mechanism allows the model to focus on different parts of the input sequence at each step of the output sequence generation, which can often lead to better performance on tasks like machine translation.
 
 # Define Attention mechanism
@@ -50,7 +51,7 @@ class Attention(nn.Module):
         v = self.v.repeat(encoder_outputs.size(0), 1).unsqueeze(1)
         # Compute attention weights using batch matrix multiplication
         attention_weights = torch.bmm(v, energy).squeeze(1)
-        # Apply softmax to get the normalised attention weights
+        # Apply softmax to get the normalized attention weights
         return torch.softmax(attention_weights, dim=1)
 
 # class Seq2Seq is a model with an attention mechanism, implemented using PyTorch. Here's a detailed breakdown:
@@ -84,21 +85,21 @@ class Attention(nn.Module):
 
 # Define Seq2Seq model class with Attention
 class Seq2Seq(nn.Module):
-    def __init__(self, hidden_dim, num_layers=2, bert_model_name='huawei-noah/TinyBERT_General_4L_312D'):
+    def __init__(self, input_vocab_size, output_vocab_size, embedding_dim, hidden_dim, num_layers=2):
         super(Seq2Seq, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        # Load pre-trained BERT model and tokenizer
-        self.bert = BertModel.from_pretrained(bert_model_name) 
-        self.tokenizer = BertTokenizer.from_pretrained(bert_model_name)
-
+        # Embedding layers for input and output vocabularies
+        self.input_embedding = nn.Embedding(input_vocab_size, embedding_dim)
+        self.output_embedding = nn.Embedding(output_vocab_size, embedding_dim)
+    
         # Encoder and Decoder RNN layers
-        self.encoder_rnn = nn.RNN(self.bert.config.hidden_size, hidden_dim, num_layers, batch_first=True)
-        self.decoder_rnn = nn.RNN(self.bert.config.hidden_size + hidden_dim, hidden_dim, num_layers, batch_first=True)
-
+        self.encoder_rnn = nn.RNN(embedding_dim, hidden_dim, num_layers, batch_first=True)
+        self.decoder_rnn = nn.RNN(embedding_dim + hidden_dim, hidden_dim, num_layers, batch_first=True)
+        
         # Fully connected output layer
-        self.fc = nn.Linear(hidden_dim, self.tokenizer.vocab_size)
+        self.fc = nn.Linear(hidden_dim, output_vocab_size)
 
         # LogSoftmax layer for inference
         self.log_softmax = nn.LogSoftmax(dim=2)
@@ -106,63 +107,33 @@ class Seq2Seq(nn.Module):
         # Attention layer
         self.attention = Attention(hidden_dim)
 
-    def forward(self, input, target=None, attention_mask=None, teacher_forcing_ratio=0.5, SOS_token=101, EOS_token=102):
-        # time = datetime.datetime.now()
-        # print(f'\nForward encoder started at {time}')
-
+    def forward(self, input, target=None, teacher_forcing_ratio=0.5, SOS_token=101, EOS_token=102):
         batch_size = input.size(0)
-        # Reduce max_len to reduce looping in embedding token by token in decoding phase to save time
-        max_len = target.size(1) if target is not None else input.size(1)*10
+        max_len = target.size(1) if target is not None else input.size(1) * 10
         vocab_size = self.fc.out_features
 
         # Initialise tensor to hold decoder outputs
         outputs = torch.zeros(batch_size, max_len, vocab_size).to(input.device)
-
-        # Encode input using BERT
-        encoded = self.bert(input, attention_mask=attention_mask)[0]
         
-        # Initialise hidden state for the RNN
+        # Encode input
+        embedded_input = self.input_embedding(input)
         h_0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim).to(input.device)
-        encoded, hidden = self.encoder_rnn(encoded, h_0)
-
+        encoded, hidden = self.encoder_rnn(embedded_input, h_0)
+        
         # Initialise decoder input as the <sos> token
         decoder_input = torch.full((batch_size,), SOS_token, dtype=torch.long, device=input.device)
-
-        # Initialise attention mask for embedding of decoder
-        attention_mask_decoder = torch.full((batch_size,), 0, dtype=torch.long, device=input.device)
-        attention_mask_decoder[:] = 1
 
         # Initialise a boolean tensor to keep track of which sequences have finished
         finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=input.device)
 
-        # time2 = datetime.datetime.now()
-        # print(f'\nForward encoder ended at {time2}')
-        # print(f'Time taken is {time2 - time}')
-
         for t in range(1, max_len):
-            # time = datetime.datetime.now()
-            # print(f'\nForward decoding loop {t} embedding started at {time}')
-
-            # Embed the decoder input using BERT embeddings
-            embedded_decoder_input = self.bert(decoder_input.unsqueeze(1), attention_mask=attention_mask_decoder.unsqueeze(1))[0]
-
-            # time2 = datetime.datetime.now()
-            # print(f'\nForward decoding loop {t} embedding ended at {time2}')
-            # print(f'Time taken is {time2 - time}')
-
-            # time = datetime.datetime.now()
-            # print(f'\nForward decoding loop {t} attention started at {time}')
-
+            # Embed the decoder input
+            embedded_decoder_input = self.output_embedding(decoder_input).unsqueeze(1)
+            
             # Calculate attention weights and apply to encoder outputs
             attn_weights = self.attention(hidden[-1], encoded)
+            temp1 = attn_weights.unsqueeze(1)
             context = attn_weights.unsqueeze(1).bmm(encoded)
-
-            # time2 = datetime.datetime.now()
-            # print(f'\nForward decoding loop {t} attention ended at {time2}')
-            # print(f'Time taken is {time2 - time}')
-
-            # time = datetime.datetime.now()
-            # print(f'\nForward decoding loop {t} decoder started at {time}')
             
             # Concatenate context vector with embedded decoder input
             rnn_input = torch.cat((embedded_decoder_input, context), 2)
@@ -183,10 +154,6 @@ class Seq2Seq(nn.Module):
 
             # Update finished_sequences
             finished_sequences |= (decoder_input == EOS_token)
-
-            # time2 = datetime.datetime.now()
-            # print(f'\nForward decoding loop {t} decoder ended at {time2}')
-            # print(f'Time taken is {time2 - time}')
             
             # Break if all sequences have finished
             if finished_sequences.all():
@@ -207,37 +174,27 @@ class RecipeDataset(Dataset):
         ingredient = self.data.iloc[idx]['dish_ingredients']
         recipe_step = self.data.iloc[idx]['dish_steps']
         
-        # Tokenize ingredients and recipe steps with attention mask
-        ingredient_encoding = self.tokenizer(ingredient, add_special_tokens=True, padding='max_length', truncation=True, return_tensors='pt')
-        recipe_step_encoding = self.tokenizer(recipe_step, add_special_tokens=True, padding='max_length', truncation=True, return_tensors='pt')
-        
-        ingredient_tokens = ingredient_encoding['input_ids'].squeeze()
-        ingredient_attention_mask = ingredient_encoding['attention_mask'].squeeze()
-        recipe_step_tokens = recipe_step_encoding['input_ids'].squeeze()
-        
-        if self.counter % 20000 == 0:
+        ingredient_tokens = self.tokenizer.encode(ingredient, add_special_tokens=True)
+        recipe_step_tokens = self.tokenizer.encode(recipe_step, add_special_tokens=True)
+
+        if (self.counter % 20000 == 0):
             self.print_bold('\nDataset:')
             self.print_bold('\nIngredient:')
             print(ingredient)
-            keys = self.find_keys_by_values(self.tokenizer.get_vocab(), ingredient_tokens.tolist())
+            keys = self.find_keys_by_values(self.tokenizer.get_vocab(), ingredient_tokens)
             self.print_bold('Token values of ingredient:')
-            print(ingredient_tokens.tolist())
+            print(ingredient_tokens)
             self.print_bold('Selected vocabularies:')
             print(keys)
             self.print_bold('\nRecipe step:')
             print(recipe_step)
-            keys = self.find_keys_by_values(self.tokenizer.get_vocab(), recipe_step_tokens.tolist())
+            keys = self.find_keys_by_values(self.tokenizer.get_vocab(), recipe_step_tokens)
             self.print_bold('Token values of recipe step:')
-            print(recipe_step_tokens.tolist())
+            print(recipe_step_tokens)
             self.print_bold('Selected vocabularies:')
             print(keys)
         self.counter += 1
-
-        return {
-            'input_ids': ingredient_tokens,
-            'attention_mask': ingredient_attention_mask,
-            'target_ids': recipe_step_tokens
-        }
+        return torch.tensor(ingredient_tokens), torch.tensor(recipe_step_tokens)
     
     def find_keys_by_values(self, dictionary, values):
         keys = []
@@ -256,7 +213,7 @@ class RecipeDataset(Dataset):
         print('\033[1m' + text + '\033[0m')
 
 class RecipeGenerator:
-    def __init__(self, embedding_model='huawei-noah/TinyBERT_General_4L_312D', hidden_dim=256, num_layers=2):
+    def __init__(self, tokenizer_model='bert-base-uncased', embedding_dim=768, hidden_dim=256, num_layers=2):
         # To support current working directory is not the directory where main.py is located.
         dir = os.path.dirname(__file__) # This file's directory
         ds = dir.split(os.sep)
@@ -270,9 +227,9 @@ class RecipeGenerator:
         if not os.path.exists(f'{self.dir}{os.sep}Outputs{os.sep}Generation'):
             os.makedirs(f'{self.dir}{os.sep}Outputs{os.sep}Generation')
         self.df = self.get_filtered_recipes(self.recipes, self.interactions)
-        self.embedding_model = embedding_model
-        self.tokenizer = BertTokenizer.from_pretrained(embedding_model)
-        self.model = Seq2Seq(hidden_dim, num_layers, embedding_model)
+        self.tokenizer_model = tokenizer_model
+        self.tokenizer = BertTokenizer.from_pretrained(tokenizer_model)
+        self.model = Seq2Seq(self.tokenizer.vocab_size, self.tokenizer.vocab_size, embedding_dim, hidden_dim, num_layers)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
 
@@ -344,12 +301,12 @@ class RecipeGenerator:
         filtered_recipes['dish_ingredients'] = filtered_recipes['ingredients'].apply(lambda x: ','.join(ast.literal_eval(x)))
         filtered_recipes['dish_steps'] = filtered_recipes['steps'].apply(lambda x: ','.join(ast.literal_eval(x)))
 
-        # To reduce tokens length
+        # To reduce sequence length
         rows_to_drop = []
         # Iterate over each row
         for index, row in filtered_recipes.iterrows():
-            # If steps have more than num_words, drop the row
-            if (sum(len(word.strip()) > 0 for word in row['steps'].replace(',', ' ').split()) > num_words):
+            # If steps have more than 100 words, drop the row
+            if (sum(len(word.strip()) > 0 for word in row['dish_steps'].replace(',', ' ').split()) > num_words):
                 rows_to_drop.append(index)
         # Drop the selected rows
         filtered_recipes = filtered_recipes.drop(rows_to_drop)
@@ -357,28 +314,21 @@ class RecipeGenerator:
         return filtered_recipes
 
     def collate_fn(self, batch):
-        # Unzip the batch of dictionaries into separate lists of input_ids, attention_masks, and target_ids
-        input_ids_batch = [item['input_ids'] for item in batch]
-        attention_masks_batch = [item['attention_mask'] for item in batch]
-        target_ids_batch = [item['target_ids'] for item in batch]
-
-        # Pad the input sequences to ensure uniform length within the batch
-        input_ids_padded = nn.utils.rnn.pad_sequence(input_ids_batch, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        # Unzip the batch of tuples into separate lists of input sequences and target sequences
+        input_batch, target_batch = zip(*batch)
         
-        # Pad the attention masks similarly to the input sequences
-        attention_masks_padded = nn.utils.rnn.pad_sequence(attention_masks_batch, batch_first=True, padding_value=0)
+        # Pad the input sequences to ensure uniform length within the batch
+        # Using batch_first=True puts the batch dimension first in the output tensor
+        # padding_value=self.tokenizer.pad_token_id specifies the value to use for padding
+        input_batch_padded = nn.utils.rnn.pad_sequence(input_batch, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         
         # Pad the target sequences similarly to the input sequences
-        target_ids_padded = nn.utils.rnn.pad_sequence(target_ids_batch, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        target_batch_padded = nn.utils.rnn.pad_sequence(target_batch, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        
+        # Move the padded input and target sequences to the specified device (e.g., GPU)
+        return input_batch_padded.to(self.device), target_batch_padded.to(self.device)
 
-        # Move the padded input, attention masks, and target sequences to the specified device (e.g., GPU)
-        return {
-            'input_ids': input_ids_padded.to(self.device),
-            'attention_mask': attention_masks_padded.to(self.device),
-            'target_ids': target_ids_padded.to(self.device)
-        }
-
-    def train(self, epochs=10, batch_size=32, learning_rate=0.001, teacher_forcing_ratio=0.5):
+    def train(self, epochs=10, batch_size=32, learning_rate=0.001, teacher_forcing_ratio=0.5, visualise_progress=100):
         # Load the dataset
         data = self.df
         
@@ -396,6 +346,7 @@ class RecipeGenerator:
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=self.collate_fn)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=self.collate_fn)
         
+        #criterion = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
         criterion = nn.NLLLoss(ignore_index=self.tokenizer.pad_token_id)
         optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
 
@@ -405,25 +356,23 @@ class RecipeGenerator:
         # Training loop
         for epoch in range(epochs):
             time = datetime.datetime.now()
-            print(f'\nEpoch {epoch+1}/{epochs} started at {time}')
+            print (f'\nEpoch {epoch+1}/{epochs} started at {time}')
 
             # Calculate the current teacher forcing ratio
             teacher_forcing_ratio = initial_teacher_forcing_ratio - (initial_teacher_forcing_ratio - final_teacher_forcing_ratio) * (epoch / (epochs-1))
 
             self.model.train()
             epoch_loss = 0
+            count = 0
+            i = 0
 
             # Get parameters before training per epoch
             params_before = {name: p.clone().detach() for name, p in self.model.named_parameters()}
 
-            for batch in tqdm(train_loader):
-                optimizer.zero_grad()
-                
-                input_batch = batch['input_ids']
-                attention_mask = batch['attention_mask']
-                target_batch = batch['target_ids']
-
-                output_tensor = self.model(input_batch, target_batch, attention_mask=attention_mask, teacher_forcing_ratio=teacher_forcing_ratio)
+            for input_batch, target_batch in tqdm(train_loader):
+                i += 1
+                optimizer.zero_grad()                
+                output_tensor = self.model(input_batch, target_batch, teacher_forcing_ratio)
 
                 # Selects all elements in the second dimension except the last one, reeshape it into a 2D tensor with shape (batch_size * (sequence_length-1), vocab_size)
                 output = output_tensor[:, :-1, :].reshape(-1, self.tokenizer.vocab_size)
@@ -437,11 +386,33 @@ class RecipeGenerator:
                 optimizer.step()                
                 epoch_loss += loss.item()
 
+                if (count % visualise_progress == 0):
+                    keys = self.find_keys_by_values(self.tokenizer.get_vocab(), input_batch[0])
+                    self.print_bold(f'\nTraining epoch {epoch+1} batch {i}:')
+                    self.print_bold('\nToken values of the first ingredients (input):')
+                    print(input_batch[0])
+                    self.print_bold('Selected vocabularies (input):')
+                    print(keys)
+
+                    keys = self.find_keys_by_values(self.tokenizer.get_vocab(), target_batch[0])
+                    self.print_bold('\nToken values of the first recipe steps (target):')
+                    print(target_batch[0])
+                    self.print_bold('Selected vocabularies (target):')
+                    print(keys)
+
+                    output_ids = output_tensor[0].argmax(dim=1).squeeze().tolist()
+                    keys = self.find_keys_by_values(self.tokenizer.get_vocab(), output_ids)
+                    self.print_bold('\nToken values of the first recipe steps (prediction):')
+                    print(output_ids)
+                    self.print_bold('Selected vocabularies (prediction):')
+                    print(keys)
+                count += 1
+
             # Get parameters after training per epoch
             params_after = {name: p for name, p in self.model.named_parameters()}
 
             # Check how many distinct parameters have changed
-            # A distinct parameter typically refers to the weights associated with a specific layer (chatgpt)
+            #  A distinct parameter typically refers to the weights associated with a specific layer (chatgpt)
             num_changed_params = sum((params_before[name] != params_after[name]).any() for name in params_before)
             print(f'\nDistinct parameters changed before and after epoch {epoch+1}/{epochs}: {num_changed_params}')
 
@@ -467,42 +438,45 @@ class RecipeGenerator:
             self.save_model_state(f'generation_model_state_save_epoch_{epoch+1}_over_{epochs}')
 
             time2 = datetime.datetime.now()
-            print(f'\nEpoch {epoch+1}/{epochs} ended at {time2}')
-            print(f'Time taken is {time2 - time}')
+            print (f'\nEpoch {epoch+1}/{epochs} ended at {time2}')
+            print (f'Time taken is {time2-time}')
 
-    def evaluate(self, dataloader, criterion, teacher_forcing_ratio=-0.1):
+    def evaluate(self, dataloader, criterion, teacher_forcing_ratio=-0.1, visualise_progress=10):
         self.model.eval()
         val_loss = 0
         count = 0
         i = 0
 
         with torch.no_grad():
-            for batch in dataloader:
+            for input_batch, target_batch in dataloader:
                 i += 1
-                input_batch = batch['input_ids']
-                target_batch = batch['target_ids']
-
                 # Ensure a sequence length in output_tensor is equal to a sequence length in target,
                 # but it doesn't use teacher forcing (negative value ensures that), therefore prediction is used token by token.
-                output_tensor = self.model(input=input_batch, target=target_batch, teacher_forcing_ratio=teacher_forcing_ratio)
+                output_tensor = self.model(input_batch, target_batch, teacher_forcing_ratio)
 
                 # Selects all elements in the second dimension except the last one, reshape it into a 2D tensor with shape (batch_size * (sequence_length-1), vocab_size)
                 output = output_tensor[:, :-1, :].reshape(-1, self.tokenizer.vocab_size)
                 # Remove the <sos> token from the target and reshape into a 1D tensor representing the target tokens with shape (batch_size * (sequence_length-1))
                 target = target_batch[:, 1:].reshape(-1)
-
                 # Calculate the loss between the predicted output and the target tokens
                 loss = criterion(output, target)
                 
                 val_loss += loss.item()
 
-                if (count % 5 == 0):
+                if (count % visualise_progress == 0):
                     keys = self.find_keys_by_values(self.tokenizer.get_vocab(), input_batch[0])
                     self.print_bold(f'\nEvaluation batch {i}:')
                     self.print_bold('\nToken values of the first ingredients (input):')
                     print(input_batch[0])
                     self.print_bold('Selected vocabularies (input):')
                     print(keys)
+
+                    keys = self.find_keys_by_values(self.tokenizer.get_vocab(), target_batch[0])
+                    self.print_bold('\nToken values of the first recipe steps (target):')
+                    print(target_batch[0])
+                    self.print_bold('Selected vocabularies (target):')
+                    print(keys)
+
                     output_ids = output_tensor[0].argmax(dim=1).squeeze().tolist()
                     keys = self.find_keys_by_values(self.tokenizer.get_vocab(), output_ids)
                     self.print_bold('\nToken values of the first recipe steps (prediction):')
@@ -558,11 +532,11 @@ class RecipeGenerator:
         print('\033[1m' + text + '\033[0m')
 
     def main(self):
-        self.print_bold(f'\nVocabularies from {self.embedding_model}:')
+        self.print_bold(f'\nVocabularies from {self.tokenizer_model}:')
         self.print_dictionary(self.tokenizer.get_vocab(), 25)
 
         if not os.path.exists(f'{self.dir}{os.sep}Outputs{os.sep}Generation{os.sep}generation_model_state_save'):
-            self.train(epochs=12, batch_size=32)
+            self.train(epochs=12, batch_size=8)
             print('Save model state as generation_model_state_save')
             self.save_model_state('generation_model_state_save')
 
